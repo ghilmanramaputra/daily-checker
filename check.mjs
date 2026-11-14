@@ -94,24 +94,64 @@ async function notify({ title, message, url, image, tags = ["racing_car"], prior
   if (!r.ok) console.log(`ntfy HTTP ${r.status}`);
 }
 
-// ---------- state ----------
-const loadState = () => (existsSync(STATE_FILE) ? JSON.parse(readFileSync(STATE_FILE, "utf8").replace(/^﻿/, "")) : { ids: null, fails: 0 });
-const saveState = (s) => writeFileSync(STATE_FILE, JSON.stringify({ ids: s.ids ? s.ids.slice(-2000) : null, fails: s.fails }, null, 0) + "\n");
+// ---------- shared state ----------
+// seen.json lives in the GitHub repo and is shared with the PC watcher, so whoever finds a
+// listing first notifies and records it, and the other one skips it. It is read fresh before
+// every check and written through the GitHub API (retrying if the other side wrote in between).
+// Without GITHUB_TOKEN (local testing) a local seen.json is used instead.
+const GH_TOKEN = process.env.GITHUB_TOKEN;
+const GH_URL = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/${STATE_FILE}`;
+const ghHeaders = () => ({ Authorization: `Bearer ${GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "buckblader-watcher" });
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const parseState = (text) => {
+  const s = JSON.parse(text.replace(/^﻿/, ""));
+  return { ids: s.ids || null, fails: s.fails || 0 };
+};
 
-async function checkOnce(state) {
+async function loadState() {
+  if (!GH_TOKEN) return { state: existsSync(STATE_FILE) ? parseState(readFileSync(STATE_FILE, "utf8")) : { ids: null, fails: 0 }, sha: null };
+  const r = await fetch(GH_URL, { headers: ghHeaders() });
+  if (r.status === 404) return { state: { ids: null, fails: 0 }, sha: null };
+  if (!r.ok) throw new Error(`GitHub GET ${r.status}`);
+  const j = await r.json();
+  return { state: parseState(Buffer.from(j.content, "base64").toString("utf8")), sha: j.sha };
+}
+
+async function updateState(mutate) {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const { state, sha } = await loadState();
+    mutate(state);
+    if (state.ids) state.ids = state.ids.slice(-2000);
+    const text = JSON.stringify(state) + "\n";
+    if (!GH_TOKEN) { writeFileSync(STATE_FILE, text); return state; }
+    const r = await fetch(GH_URL, {
+      method: "PUT",
+      headers: ghHeaders(),
+      body: JSON.stringify({ message: "Update seen listings", content: Buffer.from(text).toString("base64"), sha: sha || undefined }),
+    });
+    if (r.ok) return state;
+    if (r.status !== 409 && r.status !== 422) throw new Error(`GitHub PUT ${r.status}`);
+    await sleep(1000 + Math.random() * 2000); // the PC wrote at the same moment; reload and retry
+  }
+  throw new Error("Gagal menyimpan seen.json setelah 5x");
+}
+
+const addIds = (ids, more) => [...new Set([...(ids || []), ...more])];
+
+async function checkOnce() {
+  const { state } = await loadState();
   let items;
   try {
     items = await getTargets();
   } catch (e) {
-    state.fails = (state.fails || 0) + 1;
-    console.log(`GAGAL (${state.fails}x berturut-turut): ${e.message}`);
-    if (state.fails === 5) await notify({ title: "Watcher Buck Blader bermasalah", message: `5x gagal berturut-turut: ${e.message}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
+    const s = await updateState((st) => { st.fails += 1; });
+    console.log(`GAGAL (${s.fails}x berturut-turut): ${e.message}`);
+    if (s.fails === 5) await notify({ title: "Watcher Buck Blader bermasalah", message: `5x gagal berturut-turut: ${e.message}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
     return;
   }
-  state.fails = 0;
 
   if (!state.ids) {
-    state.ids = items.map((i) => i.id);
+    await updateState((st) => { st.ids = addIds(st.ids, items.map((i) => i.id)); st.fails = 0; });
     console.log(`Run pertama: ${items.length} listing dicatat.`);
     await notify({ title: "Watcher Buck Blader aktif (GitHub)", message: `${items.length} listing saat ini dicatat. Komputer boleh dimatikan.`, url: SEARCH_PAGE });
     return;
@@ -122,15 +162,13 @@ async function checkOnce(state) {
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
     await notify({ title: `Buck Blader baru: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb });
-    state.ids.push(n.id);
   }
+  if (fresh.length || state.fails) await updateState((st) => { st.ids = addIds(st.ids, fresh.map((n) => n.id)); st.fails = 0; });
   console.log(`OK: ${items.length} listing dicek, ${fresh.length} baru.`);
 }
 
 if (!NTFY_TOPIC) { console.log("Secret NTFY_TOPIC belum diisi."); process.exit(1); }
-const state = loadState();
 for (let i = 0; i < CHECKS; i++) {
-  if (i > 0) await new Promise((r) => setTimeout(r, INTERVAL_SEC * 1000));
-  await checkOnce(state);
-  saveState(state);
+  if (i > 0) await sleep(INTERVAL_SEC * 1000);
+  try { await checkOnce(); } catch (e) { console.log(`ERROR: ${e.message}`); }
 }
