@@ -11,6 +11,7 @@ const MUST_MATCH = ["buckblader", "buckbrader", "バックブレーダー", "バ
 const EXCLUDE = ["トレカ", "カード", "スリーブ"]; // trading cards, cards, card sleeves
 const MERCARI_API = "https://api.mercari.jp/v2/entities:search";
 const SEARCH_PAGE = "https://jp.mercari.com/search?keyword=" + encodeURIComponent("Buck Blader") + "&sort=created_time&order=desc&status=on_sale";
+const YAHOO_PAGE = "https://auctions.yahoo.co.jp/search/search?p=" + encodeURIComponent("バックブレーダー") + "&s1=new&o1=d";
 const STATE_FILE = "seen.json";
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
@@ -79,10 +80,45 @@ async function searchMercari(keyword) {
   });
 }
 
+// ---------- Yahoo! Auctions search ----------
+// The search page is a Next.js page; the listings are in its __NEXT_DATA__ JSON.
+// Ids are stored as "yahoo:<auctionId>" so they never mix with Mercari ids.
+async function searchYahoo(keyword) {
+  const url = "https://auctions.yahoo.co.jp/search/search?p=" + encodeURIComponent(keyword) + "&s1=new&o1=d&n=100";
+  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36", "Accept-Language": "ja" } });
+  if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
+  const m = (await res.text()).match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+  if (!m) throw new Error("Yahoo: data listing tidak ditemukan di halaman");
+  const listing = JSON.parse(m[1])?.props?.pageProps?.initialState?.search?.items?.listing;
+  if (!listing || !Array.isArray(listing.items)) throw new Error("Yahoo: format halaman berubah");
+  return listing.items.map((it) => ({
+    id: `yahoo:${it.auctionId}`,
+    name: it.title,
+    price: Number(it.price),
+    url: `https://auctions.yahoo.co.jp/jp/auction/${it.auctionId}`,
+    thumb: it.imageUrl,
+    yahoo: true,
+    kind: it.isFixedPrice ? "Beli langsung" : it.buyNowPrice ? `Lelang (beli langsung ${Number(it.buyNowPrice).toLocaleString("en-US")} yen)` : "Lelang",
+    end: it.endTime ? `${it.endTime.slice(8, 10)}/${it.endTime.slice(5, 7)} ${it.endTime.slice(11, 16)} JST` : "",
+  }));
+}
+
+// Searches every keyword on both sites. A failing site does not block the other one.
 async function getTargets() {
   const byId = new Map();
-  for (const kw of KEYWORDS) for (const it of await searchMercari(kw)) if (!byId.has(it.id)) byId.set(it.id, it);
-  return [...byId.values()].filter((it) => isTarget(it.name));
+  const errors = [];
+  let yahooOk = true;
+  for (const kw of KEYWORDS) {
+    for (const [site, search] of [["Mercari", searchMercari], ["Yahoo", searchYahoo]]) {
+      try {
+        for (const it of await search(kw)) if (!byId.has(it.id)) byId.set(it.id, it);
+      } catch (e) {
+        errors.push(`${site} (${kw}): ${e.message}`);
+        if (site === "Yahoo") yahooOk = false;
+      }
+    }
+  }
+  return { items: [...byId.values()].filter((it) => isTarget(it.name)), errors, yahooOk };
 }
 
 // ---------- ntfy ----------
@@ -140,14 +176,25 @@ const addIds = (ids, more) => [...new Set([...(ids || []), ...more])];
 
 async function checkOnce() {
   const { state } = await loadState();
-  let items;
-  try {
-    items = await getTargets();
-  } catch (e) {
+  const { items, errors, yahooOk } = await getTargets();
+
+  if (errors.length) {
     const s = await updateState((st) => { st.fails += 1; });
-    console.log(`GAGAL (${s.fails}x berturut-turut): ${e.message}`);
-    if (s.fails === 5) await notify({ title: "Watcher Buck Blader bermasalah", message: `5x gagal berturut-turut: ${e.message}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
-    return;
+    console.log(`GAGAL (${s.fails}x berturut-turut): ${errors.join(" | ")}`);
+    if (s.fails === 5) await notify({ title: "Watcher Buck Blader bermasalah", message: `5x gagal berturut-turut: ${errors[0]}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
+    if (errors.length === KEYWORDS.length * 2) return; // both sites failed, nothing to compare
+    state.fails = s.fails;
+  }
+
+  // First time Yahoo is checked: record its current listings silently instead of notifying them all.
+  if (state.ids && yahooOk && !state.ids.some((id) => id.startsWith("yahoo:"))) {
+    const yahooItems = items.filter((i) => i.yahoo);
+    if (yahooItems.length) {
+      await updateState((st) => { st.ids = addIds(st.ids, yahooItems.map((i) => i.id)); });
+      state.ids = addIds(state.ids, yahooItems.map((i) => i.id));
+      console.log(`Yahoo pertama kali: ${yahooItems.length} listing dicatat.`);
+      await notify({ title: "Yahoo! Auctions ditambahkan", message: `${yahooItems.length} listing Buck Blader di Yahoo! Auctions saat ini dicatat. Listing baru berikutnya akan dikirim.`, url: YAHOO_PAGE });
+    }
   }
 
   if (!state.ids) {
@@ -161,9 +208,15 @@ async function checkOnce() {
   const fresh = items.filter((i) => !seen.has(i.id));
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
-    await notify({ title: `Buck Blader baru: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb });
+    if (n.yahoo) {
+      const info = [n.kind, n.end && `berakhir ${n.end}`].filter(Boolean).join(", ");
+      await notify({ title: `Buck Blader baru (Yahoo): ${n.price.toLocaleString("en-US")} yen`, message: `${n.name}\n${info}`, url: n.url, image: n.thumb, tags: ["racing_car", "hammer"] });
+    } else {
+      await notify({ title: `Buck Blader baru: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb });
+    }
   }
-  if (fresh.length || state.fails) await updateState((st) => { st.ids = addIds(st.ids, fresh.map((n) => n.id)); st.fails = 0; });
+  const resetFails = !errors.length && state.fails;
+  if (fresh.length || resetFails) await updateState((st) => { st.ids = addIds(st.ids, fresh.map((n) => n.id)); if (resetFails) st.fails = 0; });
   console.log(`OK: ${items.length} listing dicek, ${fresh.length} baru.`);
 }
 
