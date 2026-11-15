@@ -1,4 +1,4 @@
-name: Buck Blader watcher
+name: Scheduled check
 
 on:
   schedule:
@@ -25,7 +25,7 @@ jobs:
 
       # seen.json is read and written through the GitHub API inside check.mjs,
       # shared with the PC watcher so a listing is never notified twice
-      - name: Check Mercari (3 checks, 3 minutes apart)
+      - name: Run check (3 times, 3 minutes apart)
         run: node check.mjs
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
