@@ -1,2 +1,3 @@
-# buckblader-watcher
-Notifikasi listing Tamiya Buck Blader baru di Mercari JP via ntfy
+# daily-checker
+
+Personal scheduled script. Not intended for public use.
