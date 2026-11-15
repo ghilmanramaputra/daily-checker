@@ -166,7 +166,7 @@ async function notify({ title, message, url, image, tags = ["racing_car"], prior
 // Without GITHUB_TOKEN (local testing) a local seen.json is used instead.
 const GH_TOKEN = process.env.GITHUB_TOKEN;
 const GH_URL = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/${STATE_FILE}`;
-const ghHeaders = () => ({ Authorization: `Bearer ${GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "buckblader-watcher" });
+const ghHeaders = () => ({ Authorization: `Bearer ${GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "daily-checker" });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const parseState = (text) => {
   const s = JSON.parse(text.replace(/^﻿/, ""));
