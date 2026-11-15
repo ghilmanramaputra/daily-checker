@@ -114,9 +114,22 @@ async function searchYahoo(keyword) {
     url: `https://auctions.yahoo.co.jp/jp/auction/${it.auctionId}`,
     thumb: it.imageUrl,
     yahoo: true,
-    kind: it.isFixedPrice ? "Beli langsung" : it.buyNowPrice ? `Lelang (beli langsung ${Number(it.buyNowPrice).toLocaleString("en-US")} yen)` : "Lelang",
-    end: it.endTime ? `${it.endTime.slice(8, 10)}/${it.endTime.slice(5, 7)} ${it.endTime.slice(11, 16)} JST` : "",
+    auction: !it.isFixedPrice,
+    buyNow: it.buyNowPrice ? Number(it.buyNowPrice) : 0,
+    bids: Number(it.bidCount || 0),
+    endWib: toWib(it.endTime),
   }));
+}
+
+// "2026-11-15T20:31:06+09:00" (JST) -> "Minggu, 15 Nov 2026 18:31 WIB" (UTC+7)
+const ID_DAYS = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
+const ID_MONTHS = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
+function toWib(iso) {
+  const t = Date.parse(iso || "");
+  if (Number.isNaN(t)) return "";
+  const d = new Date(t + 7 * 3600 * 1000); // shift to UTC+7, then read the UTC fields
+  const pad = (x) => String(x).padStart(2, "0");
+  return `${ID_DAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${ID_MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} WIB`;
 }
 
 // Searches every keyword on both sites. A failing site does not block the other one.
@@ -189,6 +202,7 @@ async function updateState(mutate) {
 }
 
 const addIds = (ids, more) => [...new Set([...(ids || []), ...more])];
+const yen = (n) => Number(n).toLocaleString("en-US");
 
 async function checkOnce() {
   const { state } = await loadState();
@@ -225,9 +239,13 @@ async function checkOnce() {
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
     const e = era(n.name);
-    if (n.yahoo) {
-      const info = [n.kind, n.end && `berakhir ${n.end}`].filter(Boolean).join(", ");
-      await notify({ title: `Buck Blader baru (Yahoo) ${e.label}: ${n.price.toLocaleString("en-US")} yen`, message: `${n.name}\n${info}`, url: n.url, image: n.thumb, tags: [e.tag, "hammer"] });
+    if (n.yahoo && n.auction) {
+      const lines = [n.name, `Lelang: harga saat ini ${yen(n.price)} yen, ${n.bids} bid`];
+      if (n.buyNow) lines.push(`Bisa beli langsung: ${yen(n.buyNow)} yen`);
+      if (n.endWib) lines.push(`Tutup: ${n.endWib}`);
+      await notify({ title: `Buck Blader baru (Yahoo Lelang) ${e.label}: ${yen(n.price)} yen`, message: lines.join("\n"), url: n.url, image: n.thumb, tags: [e.tag, "hammer"] });
+    } else if (n.yahoo) {
+      await notify({ title: `Buck Blader baru (Yahoo Beli Langsung) ${e.label}: ${yen(n.price)} yen`, message: `${n.name}\nHarga tetap, bisa langsung dibeli`, url: n.url, image: n.thumb, tags: [e.tag, "shopping_cart"] });
     } else {
       await notify({ title: `Buck Blader baru ${e.label}: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb, tags: [e.tag] });
     }
