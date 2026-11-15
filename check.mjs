@@ -1,6 +1,9 @@
 // Buck Blader watcher for GitHub Actions (Node 22, no dependencies)
-// Checks Mercari JP for new Tamiya Buck Blader listings and pushes them to the ntfy app.
-// State (listings already notified) is kept in seen.json, committed back by the workflow.
+// Two lanes, both pushed to the ntfy app with prices in rupiah (BCA bank notes selling rate):
+//   BARU      - every new Mercari / Yahoo! Auctions listing that passes the title filter
+//   TERMURAH  - a Mercari listing cheaper than the cheapest one known so far,
+//               plus one summary every morning (first check after 07.00 WIB)
+// State is kept in seen.json in the repo and shared with the PC watcher.
 //
 // Env: NTFY_TOPIC (required), CHECKS (checks per run, default 1), INTERVAL_SEC (gap between checks, default 180)
 
@@ -17,6 +20,8 @@ const STATE_FILE = "seen.json";
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
 const CHECKS = Number(process.env.CHECKS || 1);
 const INTERVAL_SEC = Number(process.env.INTERVAL_SEC || 180);
+const DIGEST_HOUR = 7; // morning summary: first check at or after 07.00 WIB
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
 // ---------- title filter ----------
 const norm = (s) => (s || "").normalize("NFKC").toLowerCase().replace(/[\s\-_.・]/g, "");
@@ -57,13 +62,14 @@ async function makeDpop(url, method) {
 }
 
 // ---------- Mercari search ----------
-async function searchMercari(keyword) {
+// Newest first by default (lane BARU); lane TERMURAH asks for cheapest first and may page on.
+async function searchMercariPage(keyword, { sort = "SORT_CREATED_TIME", order = "ORDER_DESC", pageSize = 60, pageToken = "" } = {}) {
   const body = {
-    userId: "", pageSize: 60, pageToken: "",
+    userId: "", pageSize, pageToken,
     searchSessionId: crypto.randomUUID().replace(/-/g, ""),
     indexRouting: "INDEX_ROUTING_UNSPECIFIED", thumbnailTypes: [],
     searchCondition: {
-      keyword, excludeKeyword: "", sort: "SORT_CREATED_TIME", order: "ORDER_DESC", status: ["STATUS_ON_SALE"],
+      keyword, excludeKeyword: "", sort, order, status: ["STATUS_ON_SALE"],
       sizeId: [], categoryId: [], brandId: [], sellerId: [], priceMin: 0, priceMax: 0,
       itemConditionId: [], shippingPayerId: [], shippingFromArea: [], shippingMethod: [],
       colorId: [], hasCoupon: false, attributes: [], itemTypes: [], skuIds: [],
@@ -78,13 +84,13 @@ async function searchMercari(keyword) {
       "X-Platform": "web",
       "Content-Type": "application/json; charset=utf-8",
       Accept: "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36",
+      "User-Agent": UA,
     },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(`Mercari HTTP ${res.status}: ${(await res.text()).slice(0, 150).replace(/\s+/g, " ")}`);
   const json = await res.json();
-  return (json.items || []).map((it) => {
+  const items = (json.items || []).map((it) => {
     const shop = it.itemType === "ITEM_TYPE_BEYOND";
     return {
       id: it.id,
@@ -94,7 +100,64 @@ async function searchMercari(keyword) {
       thumb: it.thumbnails && it.thumbnails[0],
     };
   });
+  return { items, next: (json.meta && json.meta.nextPageToken) || "" };
 }
+const searchMercari = async (keyword) => (await searchMercariPage(keyword)).items;
+
+// Lane TERMURAH: the cheapest on-sale Mercari listing that passes the title filter.
+// Results come cheapest first, so the first page holding a match holds the cheapest one.
+// Yahoo is left out on purpose: a running auction's current bid is not a selling price.
+async function collectLow() {
+  let best = null;
+  for (const kw of KEYWORDS) {
+    let pageToken = "";
+    for (let page = 0; page < 3; page++) {
+      const { items, next } = await searchMercariPage(kw, { sort: "SORT_PRICE", order: "ORDER_ASC", pageSize: 120, pageToken });
+      await sleep(300);
+      const hits = items.filter((it) => it.price > 0 && isTarget(it.name));
+      if (hits.length) {
+        const min = hits.reduce((a, b) => (b.price < a.price ? b : a));
+        if (!best || min.price < best.price) best = min;
+        break;
+      }
+      if (!next) break;
+      pageToken = next;
+    }
+  }
+  return best;
+}
+
+// ---------- BCA bank notes selling rate (rupiah per 1 yen) ----------
+let rateCache = null; // { sell, asOf, at }  at = 0 when it came from seen.json
+async function fetchBcaRate() {
+  const res = await fetch("https://www.bca.co.id/id/informasi/kurs", { headers: { "User-Agent": UA, "Accept-Language": "id" } });
+  if (!res.ok) throw new Error(`BCA HTTP ${res.status}`);
+  const html = await res.text();
+  const row = html.match(/<tr[^>]*code="JPY"[\s\S]*?rate-type="BankNotes-sell">\s*<p>\s*([\d.,]+)\s*<\/p>/);
+  if (!row) throw new Error("BCA: baris JPY bank notes tidak ditemukan");
+  const sell = Number(row[1].replace(/\./g, "").replace(",", "."));
+  if (!(sell > 20 && sell < 1000)) throw new Error(`BCA: nilai kurs tidak wajar (${row[1]})`);
+  const when = html.match(/<span>Bank Notes<\/span>\s*<br\s*\/?>\s*<span[^>]*>([^<]+)<\/span>/);
+  return { sell, asOf: when ? when[1].trim() : "" };
+}
+
+// Fresh rate at most once an hour; if BCA can't be reached the last rate in seen.json is used.
+async function getRate(state) {
+  if (rateCache && Date.now() - rateCache.at < 3600 * 1000) return rateCache;
+  try {
+    rateCache = { ...(await fetchBcaRate()), at: Date.now() };
+    console.log(`Kurs BCA terbaca: ${rateCache.sell} (${rateCache.asOf})`);
+  } catch (e) {
+    console.log(`Kurs BCA gagal diambil: ${e.message}${state.rate ? "; pakai kurs tersimpan" : ""}`);
+    if (!rateCache && state.rate) rateCache = { ...state.rate, at: 0 };
+  }
+  return rateCache;
+}
+
+const dots = (n) => String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ".");
+const rp = (yen, rate) => (rate ? `Rp ${dots(yen * rate.sell)}` : `${dots(yen)} yen (kurs BCA belum terbaca)`);
+const rateLine = (rate) => (rate ? `Kurs jual bank notes BCA: Rp ${String(rate.sell).replace(".", ",")}/yen${rate.asOf ? ` (${rate.asOf})` : ""}` : "");
+const lines = (...xs) => xs.filter(Boolean).join("\n");
 
 // ---------- Yahoo! Auctions search ----------
 // The search page is a Next.js page; the listings are in its __NEXT_DATA__ JSON.
@@ -168,15 +231,19 @@ const GH_TOKEN = process.env.GITHUB_TOKEN;
 const GH_URL = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/${STATE_FILE}`;
 const ghHeaders = () => ({ Authorization: `Bearer ${GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "daily-checker" });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// low: cheapest Mercari listing known ({id, price} in yen), lowHist: listings that were once the
+// cheapest and at what price (last 40), digestDate: WIB date of the last morning summary,
+// rate: last BCA rate read ({sell, asOf}).
 const parseState = (text) => {
   const s = JSON.parse(text.replace(/^﻿/, ""));
-  return { ids: s.ids || null, fails: s.fails || 0 };
+  return { ids: s.ids || null, fails: s.fails || 0, low: s.low || null, lowHist: s.lowHist || {}, digestDate: s.digestDate || "", rate: s.rate || null };
 };
+const emptyState = () => parseState("{}");
 
 async function loadState() {
-  if (!GH_TOKEN) return { state: existsSync(STATE_FILE) ? parseState(readFileSync(STATE_FILE, "utf8")) : { ids: null, fails: 0 }, sha: null };
+  if (!GH_TOKEN) return { state: existsSync(STATE_FILE) ? parseState(readFileSync(STATE_FILE, "utf8")) : emptyState(), sha: null };
   const r = await fetch(GH_URL, { headers: ghHeaders() });
-  if (r.status === 404) return { state: { ids: null, fails: 0 }, sha: null };
+  if (r.status === 404) return { state: emptyState(), sha: null };
   if (!r.ok) throw new Error(`GitHub GET ${r.status}`);
   const j = await r.json();
   return { state: parseState(Buffer.from(j.content, "base64").toString("utf8")), sha: j.sha };
@@ -202,11 +269,18 @@ async function updateState(mutate) {
 }
 
 const addIds = (ids, more) => [...new Set([...(ids || []), ...more])];
-const yen = (n) => Number(n).toLocaleString("en-US");
+const wibNow = () => new Date(Date.now() + 7 * 3600 * 1000); // read with the UTC getters
+const wibDate = () => wibNow().toISOString().slice(0, 10);
 
 async function checkOnce() {
   const { state } = await loadState();
+  const rate = await getRate(state);
   const { items, errors, yahooOk } = await getTargets();
+
+  // Lane TERMURAH runs on its own: if it fails, lane BARU still goes on.
+  let low = null, lowOk = true;
+  try { low = await collectLow(); }
+  catch (e) { lowOk = false; console.log(`Pencarian termurah gagal: ${e.message}`); }
 
   if (errors.length) {
     const s = await updateState((st) => { st.fails += 1; });
@@ -227,32 +301,97 @@ async function checkOnce() {
     }
   }
 
+  const rateChanged = !!(rate && rate.at && (!state.rate || state.rate.sell !== rate.sell || state.rate.asOf !== rate.asOf));
+  const saveRate = (st) => { if (rateChanged) st.rate = { sell: rate.sell, asOf: rate.asOf }; };
+  const lowChanged = lowOk && ((low && low.id) !== (state.low && state.low.id) || (low && low.price) !== (state.low && state.low.price));
+  const saveLow = (st) => {
+    if (!lowOk) return;
+    st.low = low ? { id: low.id, price: low.price } : null;
+    if (low) {
+      const h = { ...st.lowHist };
+      delete h[low.id]; // re-insert so the newest entries are the ones kept
+      h[low.id] = low.price;
+      st.lowHist = Object.fromEntries(Object.entries(h).slice(-40));
+    }
+  };
+  const digestHour = wibNow().getUTCHours() >= DIGEST_HOUR;
+
   if (!state.ids) {
-    await updateState((st) => { st.ids = addIds(st.ids, items.map((i) => i.id)); st.fails = 0; });
+    await updateState((st) => {
+      st.ids = addIds(st.ids, items.map((i) => i.id)); st.fails = 0;
+      saveLow(st); saveRate(st);
+      if (digestHour) st.digestDate = wibDate();
+    });
     console.log(`Run pertama: ${items.length} listing dicatat.`);
     await notify({ title: "Watcher Buck Blader aktif (GitHub)", message: `${items.length} listing saat ini dicatat. Komputer boleh dimatikan.`, url: SEARCH_PAGE });
     return;
   }
 
+  // Lane BARU
   const seen = new Set(state.ids);
   const fresh = items.filter((i) => !seen.has(i.id));
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
     const e = era(n.name);
     if (n.yahoo && n.auction) {
-      const lines = [n.name, `Lelang: harga saat ini ${yen(n.price)} yen, ${n.bids} bid`];
-      if (n.buyNow) lines.push(`Bisa beli langsung: ${yen(n.buyNow)} yen`);
-      if (n.endWib) lines.push(`Tutup: ${n.endWib}`);
-      await notify({ title: `Buck Blader baru (Yahoo Lelang) ${e.label}: ${yen(n.price)} yen`, message: lines.join("\n"), url: n.url, image: n.thumb, tags: [e.tag, "hammer"] });
+      await notify({
+        title: `Buck Blader baru (Yahoo Lelang) ${e.label}: ${rp(n.price, rate)}`,
+        message: lines(n.name, `Lelang: harga saat ini ${rp(n.price, rate)}, ${n.bids} bid`,
+          n.buyNow && `Bisa beli langsung: ${rp(n.buyNow, rate)}`, n.endWib && `Tutup: ${n.endWib}`, rateLine(rate)),
+        url: n.url, image: n.thumb, tags: [e.tag, "hammer"],
+      });
     } else if (n.yahoo) {
-      await notify({ title: `Buck Blader baru (Yahoo Beli Langsung) ${e.label}: ${yen(n.price)} yen`, message: `${n.name}\nHarga tetap, bisa langsung dibeli`, url: n.url, image: n.thumb, tags: [e.tag, "shopping_cart"] });
+      await notify({
+        title: `Buck Blader baru (Yahoo Beli Langsung) ${e.label}: ${rp(n.price, rate)}`,
+        message: lines(n.name, "Harga tetap, bisa langsung dibeli", rateLine(rate)),
+        url: n.url, image: n.thumb, tags: [e.tag, "shopping_cart"],
+      });
     } else {
-      await notify({ title: `Buck Blader baru ${e.label}: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb, tags: [e.tag] });
+      await notify({ title: `Buck Blader baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
     }
   }
+
+  // Lane TERMURAH: cheaper than the cheapest known so far. With no "low" recorded yet (first check
+  // with this feature) it is only recorded. A listing that was already the cheapest once at this
+  // price or lower (it only dropped out of the results for a moment) stays quiet.
+  if (lowOk && low && state.low && low.price < state.low.price) {
+    const before = state.lowHist[low.id];
+    if (before === undefined || before > low.price) {
+      const e = era(low.name);
+      console.log(`TERMURAH: ${low.price} yen (sebelumnya ${state.low.price}) | ${low.name} | ${low.url}`);
+      await notify({
+        title: `TERMURAH | Buck Blader ${e.label}: ${rp(low.price, rate)}`,
+        message: lines(low.name, `Termurah sebelumnya: ${rp(state.low.price, rate)}`, rateLine(rate)),
+        url: low.url, image: low.thumb, tags: ["moneybag"], priority: 5,
+      });
+    }
+  }
+  // First check with this feature: record today's summary as done so it starts tomorrow.
+  const lowFirst = lowOk && !state.low && !state.digestDate;
+
+  // Morning summary, once a day
+  const digestDue = lowOk && !!low && digestHour && state.digestDate !== wibDate() && !lowFirst;
+  if (digestDue) {
+    const e = era(low.name);
+    await notify({
+      title: `RANGKUMAN PAGI | Buck Blader termurah ${e.label}: ${rp(low.price, rate)}`,
+      message: lines(low.name, rateLine(rate)),
+      url: low.url, image: low.thumb, tags: ["sunrise"], priority: 3,
+    });
+    console.log("Rangkuman pagi dikirim.");
+  }
+
   const resetFails = !errors.length && state.fails;
-  if (fresh.length || resetFails) await updateState((st) => { st.ids = addIds(st.ids, fresh.map((n) => n.id)); if (resetFails) st.fails = 0; });
-  console.log(`OK: ${items.length} listing dicek, ${fresh.length} baru.`);
+  const markDigest = digestDue || (lowFirst && digestHour);
+  if (fresh.length || resetFails || lowChanged || markDigest || rateChanged) {
+    await updateState((st) => {
+      st.ids = addIds(st.ids, fresh.map((n) => n.id));
+      if (resetFails) st.fails = 0;
+      saveLow(st); saveRate(st);
+      if (markDigest) st.digestDate = wibDate();
+    });
+  }
+  console.log(`OK: ${items.length} listing dicek, ${fresh.length} baru. Termurah: ${lowOk ? (low ? `${low.price} yen = ${rp(low.price, rate)}` : "tidak ada") : "gagal"}.`);
 }
 
 if (!NTFY_TOPIC) { console.log("Secret NTFY_TOPIC belum diisi."); process.exit(1); }
