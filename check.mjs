@@ -26,6 +26,22 @@ function isTarget(name) {
   return MUST_MATCH.some((m) => n.includes(m));
 }
 
+// ---------- era label (shown in the notification, never filters anything) ----------
+// 19303 = original March 1997 kit, 95532 = February 2020 re-issue. Item numbers in the title win;
+// otherwise seller words: 当時物 (vintage) vs 再販/復刻 (re-release). ntfy turns the tag into an emoji.
+function era(name) {
+  const n = (name || "").normalize("NFKC");
+  const has1997 = n.includes("19303"), has2020 = n.includes("95532");
+  let old = has1997 && !has2020, reissue = has2020 && !has1997;
+  if (!has1997 && !has2020) {
+    const o = /当時物|当時もの/.test(n), r = /再販|復刻/.test(n);
+    old = o && !r; reissue = r && !o;
+  }
+  if (old) return { label: "[1997 / 19303]", tag: "jp" };
+  if (reissue) return { label: "[2020 / 95532]", tag: "repeat" };
+  return { label: "[belum jelas]", tag: "grey_question" };
+}
+
 // ---------- DPoP token (ES256 JWT that Mercari's API requires) ----------
 const b64u = (buf) => Buffer.from(buf).toString("base64url");
 const b64uText = (s) => b64u(new TextEncoder().encode(s));
@@ -208,11 +224,12 @@ async function checkOnce() {
   const fresh = items.filter((i) => !seen.has(i.id));
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
+    const e = era(n.name);
     if (n.yahoo) {
       const info = [n.kind, n.end && `berakhir ${n.end}`].filter(Boolean).join(", ");
-      await notify({ title: `Buck Blader baru (Yahoo): ${n.price.toLocaleString("en-US")} yen`, message: `${n.name}\n${info}`, url: n.url, image: n.thumb, tags: ["racing_car", "hammer"] });
+      await notify({ title: `Buck Blader baru (Yahoo) ${e.label}: ${n.price.toLocaleString("en-US")} yen`, message: `${n.name}\n${info}`, url: n.url, image: n.thumb, tags: [e.tag, "hammer"] });
     } else {
-      await notify({ title: `Buck Blader baru: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb });
+      await notify({ title: `Buck Blader baru ${e.label}: ${n.price.toLocaleString("en-US")} yen`, message: n.name, url: n.url, image: n.thumb, tags: [e.tag] });
     }
   }
   const resetFails = !errors.length && state.fails;
