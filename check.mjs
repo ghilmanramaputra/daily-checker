@@ -31,6 +31,22 @@ function isTarget(name) {
   return MUST_MATCH.some((m) => n.includes(m));
 }
 
+// Lane TERMURAH only looks at the car kit itself, so loose bits never count as "cheapest":
+// stickers/seals, manuals, Bandai collectibles, magazine freebies, goods, spare parts, body sets.
+// "ステッカー付" / "シール付" (sticker included) is a kit with extras and stays in. A title naming a
+// body counts as a body set unless it also names the chassis (a complete car).
+const LOW_EXCLUDE = ["ステッカー", "シール", "説明書", "バンダイ", "付録", "グッズ", "ホログラム",
+  "グレードアップパーツ", "ブレーキステー", "ポリカ"].map(norm);
+const LOW_KEEP = ["ステッカー付", "シール付"].map(norm);
+function isLowTarget(it) {
+  if (!(it.price > 0) || !isTarget(it.name)) return false;
+  let n = norm(it.name);
+  for (const k of LOW_KEEP) n = n.split(k).join("");
+  if (LOW_EXCLUDE.some((x) => n.includes(x))) return false;
+  if (n.includes("ボディ") && !n.includes("シャーシ")) return false;
+  return true;
+}
+
 // ---------- era label (shown in the notification, never filters anything) ----------
 // 19303 = original March 1997 kit, 95532 = February 2020 re-issue. Item numbers in the title win;
 // otherwise seller words: 当時物 (vintage) vs 再販/復刻 (re-release). ntfy turns the tag into an emoji.
@@ -104,7 +120,7 @@ async function searchMercariPage(keyword, { sort = "SORT_CREATED_TIME", order = 
 }
 const searchMercari = async (keyword) => (await searchMercariPage(keyword)).items;
 
-// Lane TERMURAH: the cheapest on-sale Mercari listing that passes the title filter.
+// Lane TERMURAH: the cheapest on-sale Mercari listing that passes the title filter and isLowTarget.
 // Results come cheapest first, so the first page holding a match holds the cheapest one.
 // Yahoo is left out on purpose: a running auction's current bid is not a selling price.
 async function collectLow() {
@@ -114,7 +130,7 @@ async function collectLow() {
     for (let page = 0; page < 3; page++) {
       const { items, next } = await searchMercariPage(kw, { sort: "SORT_PRICE", order: "ORDER_ASC", pageSize: 120, pageToken });
       await sleep(300);
-      const hits = items.filter((it) => it.price > 0 && isTarget(it.name));
+      const hits = items.filter(isLowTarget);
       if (hits.length) {
         const min = hits.reduce((a, b) => (b.price < a.price ? b : a));
         if (!best || min.price < best.price) best = min;
