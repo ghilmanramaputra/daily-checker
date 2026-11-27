@@ -15,6 +15,8 @@ const CFG = JSON.parse((process.env.WATCH_CONFIG
   ? Buffer.from(process.env.WATCH_CONFIG.trim(), "base64").toString("utf8")
   : readFileSync(new URL("./config.json", import.meta.url), "utf8")).replace(/^﻿/, ""));
 const NAME = CFG.name;
+// Public Actions logs: the runner replaces these words with *** wherever they would appear.
+if (process.env.GITHUB_ACTIONS) for (const v of [NAME, ...CFG.keywords, ...CFG.mustMatch]) if (v && v.length > 3) console.log(`::add-mask::${v}`);
 const KEYWORDS = CFG.keywords;
 const MERCARI_API = "https://api.mercari.jp/v2/entities:search";
 const SEARCH_PAGE = "https://jp.mercari.com/search?keyword=" + encodeURIComponent(KEYWORDS[0]) + "&sort=created_time&order=desc&status=on_sale";
@@ -301,7 +303,7 @@ async function checkOnce() {
   const seen = new Set(state.ids);
   const fresh = items.filter((i) => !seen.has(i.id));
   for (const n of fresh) {
-    console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
+    console.log(`BARU: ${n.price} yen`); // no title or link: Actions logs of a public repo are public
     const e = era(n.name);
     await notify({ title: `${NAME} baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
   }
@@ -313,7 +315,7 @@ async function checkOnce() {
     const before = state.lowHist[low.id];
     if (before === undefined || before > low.price) {
       const e = era(low.name);
-      console.log(`TERMURAH: ${low.price} yen (sebelumnya ${state.low.price}) | ${low.name} | ${low.url}`);
+      console.log(`TERMURAH: ${low.price} yen (sebelumnya ${state.low.price})`);
       await notify({
         title: `TERMURAH | ${NAME} ${e.label}: ${rp(low.price, rate)}`,
         message: lines(low.name, `Termurah sebelumnya: ${rp(state.low.price, rate)}`, rateLine(rate)),
