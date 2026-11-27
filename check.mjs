@@ -1,6 +1,7 @@
 // Buck Blader watcher for GitHub Actions (Node 22, no dependencies)
 // Two lanes, both pushed to the ntfy app with prices in rupiah (BCA bank notes selling rate):
-//   BARU      - every new Mercari / Yahoo! Auctions listing that passes the title filter
+//   BARU      - every new Mercari listing that passes the title filter
+//               (Yahoo! Auctions has its own watcher: repo yahoo-buck-blader)
 //   TERMURAH  - a Mercari listing cheaper than the cheapest one known so far,
 //               plus one summary every morning (first check after 07.00 WIB)
 // State is kept in seen.json in the repo and shared with the PC watcher.
@@ -14,7 +15,6 @@ const MUST_MATCH = ["buckblader", "buckbrader", "バックブレーダー", "バ
 const EXCLUDE = ["トレカ", "カード", "スリーブ"]; // trading cards, cards, card sleeves
 const MERCARI_API = "https://api.mercari.jp/v2/entities:search";
 const SEARCH_PAGE = "https://jp.mercari.com/search?keyword=" + encodeURIComponent("Buck Blader") + "&sort=created_time&order=desc&status=on_sale";
-const YAHOO_PAGE = "https://auctions.yahoo.co.jp/search/search?p=" + encodeURIComponent("バックブレーダー") + "&s1=new&o1=d";
 const STATE_FILE = "seen.json";
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
@@ -122,7 +122,6 @@ const searchMercari = async (keyword) => (await searchMercariPage(keyword)).item
 
 // Lane TERMURAH: the cheapest on-sale Mercari listing that passes the title filter and isLowTarget.
 // Results come cheapest first, so the first page holding a match holds the cheapest one.
-// Yahoo is left out on purpose: a running auction's current bid is not a selling price.
 async function collectLow() {
   let best = null;
   for (const kw of KEYWORDS) {
@@ -175,58 +174,18 @@ const rp = (yen, rate) => (rate ? `Rp ${dots(yen * rate.sell)}` : `${dots(yen)} 
 const rateLine = (rate) => (rate ? `Kurs jual bank notes BCA: Rp ${String(rate.sell).replace(".", ",")}/yen${rate.asOf ? ` (${rate.asOf})` : ""}` : "");
 const lines = (...xs) => xs.filter(Boolean).join("\n");
 
-// ---------- Yahoo! Auctions search ----------
-// The search page is a Next.js page; the listings are in its __NEXT_DATA__ JSON.
-// Ids are stored as "yahoo:<auctionId>" so they never mix with Mercari ids.
-async function searchYahoo(keyword) {
-  const url = "https://auctions.yahoo.co.jp/search/search?p=" + encodeURIComponent(keyword) + "&s1=new&o1=d&n=100";
-  const res = await fetch(url, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36", "Accept-Language": "ja" } });
-  if (!res.ok) throw new Error(`Yahoo HTTP ${res.status}`);
-  const m = (await res.text()).match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
-  if (!m) throw new Error("Yahoo: data listing tidak ditemukan di halaman");
-  const listing = JSON.parse(m[1])?.props?.pageProps?.initialState?.search?.items?.listing;
-  if (!listing || !Array.isArray(listing.items)) throw new Error("Yahoo: format halaman berubah");
-  return listing.items.map((it) => ({
-    id: `yahoo:${it.auctionId}`,
-    name: it.title,
-    price: Number(it.price),
-    url: `https://auctions.yahoo.co.jp/jp/auction/${it.auctionId}`,
-    thumb: it.imageUrl,
-    yahoo: true,
-    auction: !it.isFixedPrice,
-    buyNow: it.buyNowPrice ? Number(it.buyNowPrice) : 0,
-    bids: Number(it.bidCount || 0),
-    endWib: toWib(it.endTime),
-  }));
-}
-
-// "2026-11-15T20:31:06+09:00" (JST) -> "Minggu, 15 Nov 2026 18:31 WIB" (UTC+7)
-const ID_DAYS = ["Minggu", "Senin", "Selasa", "Rabu", "Kamis", "Jumat", "Sabtu"];
-const ID_MONTHS = ["Jan", "Feb", "Mar", "Apr", "Mei", "Jun", "Jul", "Agu", "Sep", "Okt", "Nov", "Des"];
-function toWib(iso) {
-  const t = Date.parse(iso || "");
-  if (Number.isNaN(t)) return "";
-  const d = new Date(t + 7 * 3600 * 1000); // shift to UTC+7, then read the UTC fields
-  const pad = (x) => String(x).padStart(2, "0");
-  return `${ID_DAYS[d.getUTCDay()]}, ${d.getUTCDate()} ${ID_MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} WIB`;
-}
-
-// Searches every keyword on both sites. A failing site does not block the other one.
+// Searches every keyword on Mercari. A failing keyword does not block the other one.
 async function getTargets() {
   const byId = new Map();
   const errors = [];
-  let yahooOk = true;
   for (const kw of KEYWORDS) {
-    for (const [site, search] of [["Mercari", searchMercari], ["Yahoo", searchYahoo]]) {
-      try {
-        for (const it of await search(kw)) if (!byId.has(it.id)) byId.set(it.id, it);
-      } catch (e) {
-        errors.push(`${site} (${kw}): ${e.message}`);
-        if (site === "Yahoo") yahooOk = false;
-      }
+    try {
+      for (const it of await searchMercari(kw)) if (!byId.has(it.id)) byId.set(it.id, it);
+    } catch (e) {
+      errors.push(`Mercari (${kw}): ${e.message}`);
     }
   }
-  return { items: [...byId.values()].filter((it) => isTarget(it.name)), errors, yahooOk };
+  return { items: [...byId.values()].filter((it) => isTarget(it.name)), errors };
 }
 
 // ---------- ntfy ----------
@@ -291,7 +250,7 @@ const wibDate = () => wibNow().toISOString().slice(0, 10);
 async function checkOnce() {
   const { state } = await loadState();
   const rate = await getRate(state);
-  const { items, errors, yahooOk } = await getTargets();
+  const { items, errors } = await getTargets();
 
   // Lane TERMURAH runs on its own: if it fails, lane BARU still goes on.
   let low = null, lowOk = true;
@@ -302,19 +261,8 @@ async function checkOnce() {
     const s = await updateState((st) => { st.fails += 1; });
     console.log(`GAGAL (${s.fails}x berturut-turut): ${errors.join(" | ")}`);
     if (s.fails === 5) await notify({ title: "Watcher Buck Blader bermasalah", message: `5x gagal berturut-turut: ${errors[0]}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
-    if (errors.length === KEYWORDS.length * 2) return; // both sites failed, nothing to compare
+    if (errors.length === KEYWORDS.length) return; // every search failed, nothing to compare
     state.fails = s.fails;
-  }
-
-  // First time Yahoo is checked: record its current listings silently instead of notifying them all.
-  if (state.ids && yahooOk && !state.ids.some((id) => id.startsWith("yahoo:"))) {
-    const yahooItems = items.filter((i) => i.yahoo);
-    if (yahooItems.length) {
-      await updateState((st) => { st.ids = addIds(st.ids, yahooItems.map((i) => i.id)); });
-      state.ids = addIds(state.ids, yahooItems.map((i) => i.id));
-      console.log(`Yahoo pertama kali: ${yahooItems.length} listing dicatat.`);
-      await notify({ title: "Yahoo! Auctions ditambahkan", message: `${yahooItems.length} listing Buck Blader di Yahoo! Auctions saat ini dicatat. Listing baru berikutnya akan dikirim.`, url: YAHOO_PAGE });
-    }
   }
 
   const rateChanged = !!(rate && rate.at && (!state.rate || state.rate.sell !== rate.sell || state.rate.asOf !== rate.asOf));
@@ -349,22 +297,7 @@ async function checkOnce() {
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
     const e = era(n.name);
-    if (n.yahoo && n.auction) {
-      await notify({
-        title: `Buck Blader baru (Yahoo Lelang) ${e.label}: ${rp(n.price, rate)}`,
-        message: lines(n.name, `Lelang: harga saat ini ${rp(n.price, rate)}, ${n.bids} bid`,
-          n.buyNow && `Bisa beli langsung: ${rp(n.buyNow, rate)}`, n.endWib && `Tutup: ${n.endWib}`, rateLine(rate)),
-        url: n.url, image: n.thumb, tags: [e.tag, "hammer"],
-      });
-    } else if (n.yahoo) {
-      await notify({
-        title: `Buck Blader baru (Yahoo Beli Langsung) ${e.label}: ${rp(n.price, rate)}`,
-        message: lines(n.name, "Harga tetap, bisa langsung dibeli", rateLine(rate)),
-        url: n.url, image: n.thumb, tags: [e.tag, "shopping_cart"],
-      });
-    } else {
-      await notify({ title: `Buck Blader baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
-    }
+    await notify({ title: `Buck Blader baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
   }
 
   // Lane TERMURAH: cheaper than the cheapest known so far. With no "low" recorded yet (first check
