@@ -1,20 +1,23 @@
-// Buck Blader watcher for GitHub Actions (Node 22, no dependencies)
-// Two lanes, both pushed to the ntfy app with prices in rupiah (BCA bank notes selling rate):
-//   BARU      - every new Mercari listing that passes the title filter
-//               (Yahoo! Auctions has its own watcher: repo yahoo-buck-blader)
-//   TERMURAH  - a Mercari listing cheaper than the cheapest one known so far,
+// Scheduled listing checker for GitHub Actions (Node 22, no dependencies)
+// Two lanes, both pushed to ntfy with prices in rupiah (BCA bank notes selling rate):
+//   BARU      - every new listing that passes the title filter
+//   TERMURAH  - a listing cheaper than the cheapest one known so far,
 //               plus one summary every morning (first check after 07.00 WIB)
 // State is kept in seen.json in the repo and shared with the PC watcher.
 //
-// Env: NTFY_TOPIC (required), CHECKS (checks per run, default 1), INTERVAL_SEC (gap between checks, default 180)
+// What is searched (name, keywords, filters) is not in this repo: it comes from the WATCH_CONFIG
+// secret (base64 of config.json), or from a local config.json when run elsewhere.
+// Env: NTFY_TOPIC, WATCH_CONFIG, CHECKS (checks per run, default 1), INTERVAL_SEC (default 180)
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
 
-const KEYWORDS = ["Buck Blader", "バックブレーダー"];
-const MUST_MATCH = ["buckblader", "buckbrader", "バックブレーダー", "バックブレイダー"];
-const EXCLUDE = ["トレカ", "カード", "スリーブ"]; // trading cards, cards, card sleeves
+const CFG = JSON.parse((process.env.WATCH_CONFIG
+  ? Buffer.from(process.env.WATCH_CONFIG.trim(), "base64").toString("utf8")
+  : readFileSync(new URL("./config.json", import.meta.url), "utf8")).replace(/^﻿/, ""));
+const NAME = CFG.name;
+const KEYWORDS = CFG.keywords;
 const MERCARI_API = "https://api.mercari.jp/v2/entities:search";
-const SEARCH_PAGE = "https://jp.mercari.com/search?keyword=" + encodeURIComponent("Buck Blader") + "&sort=created_time&order=desc&status=on_sale";
+const SEARCH_PAGE = "https://jp.mercari.com/search?keyword=" + encodeURIComponent(KEYWORDS[0]) + "&sort=created_time&order=desc&status=on_sale";
 const STATE_FILE = "seen.json";
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
@@ -25,42 +28,45 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 // ---------- title filter ----------
 const norm = (s) => (s || "").normalize("NFKC").toLowerCase().replace(/[\s\-_.・]/g, "");
+const MUST_MATCH = CFG.mustMatch.map(norm);
+const EXCLUDE = (CFG.exclude || []).map(norm);
 function isTarget(name) {
   const n = norm(name);
   if (EXCLUDE.some((x) => n.includes(x))) return false;
   return MUST_MATCH.some((m) => n.includes(m));
 }
 
-// Lane TERMURAH only looks at the car kit itself, so loose bits never count as "cheapest":
-// stickers/seals, manuals, Bandai collectibles, magazine freebies, goods, spare parts, body sets.
-// "ステッカー付" / "シール付" (sticker included) is a kit with extras and stays in. A title naming a
-// body counts as a body set unless it also names the chassis (a complete car).
-const LOW_EXCLUDE = ["ステッカー", "シール", "説明書", "バンダイ", "付録", "グッズ", "ホログラム",
-  "グレードアップパーツ", "ブレーキステー", "ポリカ"].map(norm);
-const LOW_KEEP = ["ステッカー付", "シール付"].map(norm);
+// Lane TERMURAH only looks at the complete item, so loose bits never count as "cheapest".
+// lowKeep phrases are removed before lowExclude is applied (an item "with extras" stays in).
+// A title with lowPartWord counts as a part unless it also has lowWholeWord.
+const LOW_EXCLUDE = (CFG.lowExclude || []).map(norm);
+const LOW_KEEP = (CFG.lowKeep || []).map(norm);
+const LOW_PART = norm(CFG.lowPartWord || ""), LOW_WHOLE = norm(CFG.lowWholeWord || "");
 function isLowTarget(it) {
   if (!(it.price > 0) || !isTarget(it.name)) return false;
   let n = norm(it.name);
   for (const k of LOW_KEEP) n = n.split(k).join("");
   if (LOW_EXCLUDE.some((x) => n.includes(x))) return false;
-  if (n.includes("ボディ") && !n.includes("シャーシ")) return false;
+  if (LOW_PART && n.includes(LOW_PART) && !(LOW_WHOLE && n.includes(LOW_WHOLE))) return false;
   return true;
 }
 
-// ---------- era label (shown in the notification, never filters anything) ----------
-// 19303 = original March 1997 kit, 95532 = February 2020 re-issue. Item numbers in the title win;
-// otherwise seller words: 当時物 (vintage) vs 再販/復刻 (re-release). ntfy turns the tag into an emoji.
+// ---------- edition label (shown in the notification, never filters anything) ----------
+// Item numbers from the config win; otherwise seller words: 当時物 (vintage) vs 再販/復刻
+// (re-release). ntfy turns the tag into an emoji.
 function era(name) {
+  const E = CFG.era;
+  if (!E) return { label: "", tag: "new" };
   const n = (name || "").normalize("NFKC");
-  const has1997 = n.includes("19303"), has2020 = n.includes("95532");
-  let old = has1997 && !has2020, reissue = has2020 && !has1997;
-  if (!has1997 && !has2020) {
+  const hasOld = E.old.codes.some((c) => n.includes(c)), hasNew = E.reissue.codes.some((c) => n.includes(c));
+  let old = hasOld && !hasNew, reissue = hasNew && !hasOld;
+  if (!hasOld && !hasNew) {
     const o = /当時物|当時もの/.test(n), r = /再販|復刻/.test(n);
     old = o && !r; reissue = r && !o;
   }
-  if (old) return { label: "[1997 / 19303]", tag: "jp" };
-  if (reissue) return { label: "[2020 / 95532]", tag: "repeat" };
-  return { label: "[belum jelas]", tag: "grey_question" };
+  if (old) return { label: E.old.label, tag: "jp" };
+  if (reissue) return { label: E.reissue.label, tag: "repeat" };
+  return { label: E.unknownLabel || "", tag: "grey_question" };
 }
 
 // ---------- DPoP token (ES256 JWT that Mercari's API requires) ----------
@@ -260,7 +266,7 @@ async function checkOnce() {
   if (errors.length) {
     const s = await updateState((st) => { st.fails += 1; });
     console.log(`GAGAL (${s.fails}x berturut-turut): ${errors.join(" | ")}`);
-    if (s.fails === 5) await notify({ title: "Watcher Buck Blader bermasalah", message: `5x gagal berturut-turut: ${errors[0]}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
+    if (s.fails === 5) await notify({ title: `Watcher ${NAME} bermasalah`, message: `5x gagal berturut-turut: ${errors[0]}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
     if (errors.length === KEYWORDS.length) return; // every search failed, nothing to compare
     state.fails = s.fails;
   }
@@ -287,7 +293,7 @@ async function checkOnce() {
       if (digestHour) st.digestDate = wibDate();
     });
     console.log(`Run pertama: ${items.length} listing dicatat.`);
-    await notify({ title: "Watcher Buck Blader aktif (GitHub)", message: `${items.length} listing saat ini dicatat. Komputer boleh dimatikan.`, url: SEARCH_PAGE });
+    await notify({ title: `Watcher ${NAME} aktif (GitHub)`, message: `${items.length} listing saat ini dicatat. Komputer boleh dimatikan.`, url: SEARCH_PAGE });
     return;
   }
 
@@ -297,7 +303,7 @@ async function checkOnce() {
   for (const n of fresh) {
     console.log(`BARU: ${n.price} yen | ${n.name} | ${n.url}`);
     const e = era(n.name);
-    await notify({ title: `Buck Blader baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
+    await notify({ title: `${NAME} baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
   }
 
   // Lane TERMURAH: cheaper than the cheapest known so far. With no "low" recorded yet (first check
@@ -309,7 +315,7 @@ async function checkOnce() {
       const e = era(low.name);
       console.log(`TERMURAH: ${low.price} yen (sebelumnya ${state.low.price}) | ${low.name} | ${low.url}`);
       await notify({
-        title: `TERMURAH | Buck Blader ${e.label}: ${rp(low.price, rate)}`,
+        title: `TERMURAH | ${NAME} ${e.label}: ${rp(low.price, rate)}`,
         message: lines(low.name, `Termurah sebelumnya: ${rp(state.low.price, rate)}`, rateLine(rate)),
         url: low.url, image: low.thumb, tags: ["moneybag"], priority: 5,
       });
@@ -323,7 +329,7 @@ async function checkOnce() {
   if (digestDue) {
     const e = era(low.name);
     await notify({
-      title: `RANGKUMAN PAGI | Buck Blader termurah ${e.label}: ${rp(low.price, rate)}`,
+      title: `RANGKUMAN PAGI | ${NAME} termurah ${e.label}: ${rp(low.price, rate)}`,
       message: lines(low.name, rateLine(rate)),
       url: low.url, image: low.thumb, tags: ["sunrise"], priority: 3,
     });
