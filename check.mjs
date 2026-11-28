@@ -5,8 +5,10 @@
 //               plus one summary every morning (first check after 07.00 WIB)
 // State is kept in seen.json in the repo and shared with the PC watcher.
 //
-// What is searched (name, keywords, filters) is not in this repo: it comes from the WATCH_CONFIG
+// What is searched (products, keywords, filters) is not in this repo: it comes from the WATCH_CONFIG
 // secret (base64 of config.json), or from a local config.json when run elsewhere.
+// config.json is { products: [ {key, name, keywords, mustMatch, exclude, lowExclude, ...} ] };
+// a single product object without "products" still works (it gets the key "bb").
 // Env: NTFY_TOPIC, WATCH_CONFIG, CHECKS (checks per run, default 1), INTERVAL_SEC (default 180)
 
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
@@ -14,12 +16,7 @@ import { readFileSync, writeFileSync, existsSync } from "node:fs";
 const CFG = JSON.parse((process.env.WATCH_CONFIG
   ? Buffer.from(process.env.WATCH_CONFIG.trim(), "base64").toString("utf8")
   : readFileSync(new URL("./config.json", import.meta.url), "utf8")).replace(/^﻿/, ""));
-const NAME = CFG.name;
-// Public Actions logs: the runner replaces these words with *** wherever they would appear.
-if (process.env.GITHUB_ACTIONS) for (const v of [NAME, ...CFG.keywords, ...CFG.mustMatch]) if (v && v.length > 3) console.log(`::add-mask::${v}`);
-const KEYWORDS = CFG.keywords;
 const MERCARI_API = "https://api.mercari.jp/v2/entities:search";
-const SEARCH_PAGE = "https://jp.mercari.com/search?keyword=" + encodeURIComponent(KEYWORDS[0]) + "&sort=created_time&order=desc&status=on_sale";
 const STATE_FILE = "seen.json";
 
 const NTFY_TOPIC = process.env.NTFY_TOPIC;
@@ -30,46 +27,66 @@ const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 // ---------- title filter ----------
 const norm = (s) => (s || "").normalize("NFKC").toLowerCase().replace(/[\s\-_.・]/g, "");
-const MUST_MATCH = CFG.mustMatch.map(norm);
-const EXCLUDE = (CFG.exclude || []).map(norm);
-function isTarget(name) {
+const PRODUCTS = (CFG.products || [CFG]).map((p, i) => ({
+  key: p.key || (i === 0 ? "bb" : `p${i + 1}`),
+  name: p.name,
+  keywords: p.keywords,
+  mustMatch: p.mustMatch.map(norm),
+  exclude: (p.exclude || []).map(norm),
+  lowExclude: (p.lowExclude || []).map(norm),
+  lowKeep: (p.lowKeep || []).map(norm),
+  lowPart: norm(p.lowPartWord || ""),
+  lowWhole: norm(p.lowWholeWord || ""),
+  era: p.era || null,
+  page: "https://jp.mercari.com/search?keyword=" + encodeURIComponent(p.keywords[0]) + "&sort=created_time&order=desc&status=on_sale",
+}));
+// Records written before there were several products belong to the first product.
+const LEGACY_KEY = PRODUCTS[0].key;
+const ALL_NAMES = PRODUCTS.map((p) => p.name).join(" + ");
+// Public Actions logs: the runner replaces these words with *** wherever they would appear.
+if (process.env.GITHUB_ACTIONS) {
+  for (const p of PRODUCTS) for (const v of [p.name, ...p.keywords, ...p.mustMatch]) if (v && v.length > 3) console.log(`::add-mask::${v}`);
+}
+
+function isTarget(p, name) {
   const n = norm(name);
-  if (EXCLUDE.some((x) => n.includes(x))) return false;
-  return MUST_MATCH.some((m) => n.includes(m));
+  if (p.exclude.some((x) => n.includes(x))) return false;
+  return p.mustMatch.some((m) => n.includes(m));
 }
 
 // Lane TERMURAH only looks at the complete item, so loose bits never count as "cheapest".
 // lowKeep phrases are removed before lowExclude is applied (an item "with extras" stays in).
 // A title with lowPartWord counts as a part unless it also has lowWholeWord.
-const LOW_EXCLUDE = (CFG.lowExclude || []).map(norm);
-const LOW_KEEP = (CFG.lowKeep || []).map(norm);
-const LOW_PART = norm(CFG.lowPartWord || ""), LOW_WHOLE = norm(CFG.lowWholeWord || "");
-function isLowTarget(it) {
-  if (!(it.price > 0) || !isTarget(it.name)) return false;
+function isLowTarget(p, it) {
+  if (!(it.price > 0) || !isTarget(p, it.name)) return false;
   let n = norm(it.name);
-  for (const k of LOW_KEEP) n = n.split(k).join("");
-  if (LOW_EXCLUDE.some((x) => n.includes(x))) return false;
-  if (LOW_PART && n.includes(LOW_PART) && !(LOW_WHOLE && n.includes(LOW_WHOLE))) return false;
+  for (const k of p.lowKeep) n = n.split(k).join("");
+  if (p.lowExclude.some((x) => n.includes(x))) return false;
+  if (p.lowPart && n.includes(p.lowPart) && !(p.lowWhole && n.includes(p.lowWhole))) return false;
   return true;
 }
 
 // ---------- edition label (shown in the notification, never filters anything) ----------
-// Item numbers from the config win; otherwise seller words: 当時物 (vintage) vs 再販/復刻
-// (re-release). ntfy turns the tag into an emoji.
-function era(name) {
-  const E = CFG.era;
+// Special editions (era.variants: item numbers or words) come first. Then item numbers of the
+// original (era.old) and the re-issue (era.reissue, optional); otherwise seller words:
+// 当時物 (vintage) vs 再販/復刻 (re-release). ntfy turns the tag into an emoji.
+function era(p, name) {
+  const E = p.era;
   if (!E) return { label: "", tag: "new" };
   const n = (name || "").normalize("NFKC");
-  const hasOld = E.old.codes.some((c) => n.includes(c)), hasNew = E.reissue.codes.some((c) => n.includes(c));
+  const any = (xs) => (xs || []).some((c) => n.includes(c));
+  for (const v of E.variants || []) if (any(v.codes) || any(v.words)) return { label: v.label, tag: v.tag || "star" };
+  const hasOld = any(E.old && E.old.codes), hasNew = any(E.reissue && E.reissue.codes);
   let old = hasOld && !hasNew, reissue = hasNew && !hasOld;
   if (!hasOld && !hasNew) {
     const o = /当時物|当時もの/.test(n), r = /再販|復刻/.test(n);
     old = o && !r; reissue = r && !o;
   }
-  if (old) return { label: E.old.label, tag: "jp" };
-  if (reissue) return { label: E.reissue.label, tag: "repeat" };
+  if (old && E.old) return { label: E.old.label, tag: "jp" };
+  if (reissue && E.reissue) return { label: E.reissue.label, tag: "repeat" };
   return { label: E.unknownLabel || "", tag: "grey_question" };
 }
+const withLabel = (text, e) => (e.label ? `${text} ${e.label}` : text);
 
 // ---------- DPoP token (ES256 JWT that Mercari's API requires) ----------
 const b64u = (buf) => Buffer.from(buf).toString("base64url");
@@ -128,16 +145,16 @@ async function searchMercariPage(keyword, { sort = "SORT_CREATED_TIME", order = 
 }
 const searchMercari = async (keyword) => (await searchMercariPage(keyword)).items;
 
-// Lane TERMURAH: the cheapest on-sale Mercari listing that passes the title filter and isLowTarget.
+// Lane TERMURAH: the cheapest on-sale Mercari listing of one product that passes isLowTarget.
 // Results come cheapest first, so the first page holding a match holds the cheapest one.
-async function collectLow() {
+async function collectLow(p) {
   let best = null;
-  for (const kw of KEYWORDS) {
+  for (const kw of p.keywords) {
     let pageToken = "";
     for (let page = 0; page < 3; page++) {
       const { items, next } = await searchMercariPage(kw, { sort: "SORT_PRICE", order: "ORDER_ASC", pageSize: 120, pageToken });
       await sleep(300);
-      const hits = items.filter(isLowTarget);
+      const hits = items.filter((it) => isLowTarget(p, it));
       if (hits.length) {
         const min = hits.reduce((a, b) => (b.price < a.price ? b : a));
         if (!best || min.price < best.price) best = min;
@@ -212,19 +229,32 @@ function rateLine(rate) {
 }
 const lines = (...xs) => xs.filter(Boolean).join("\n");
 
-// Searches every keyword on Mercari. A failing keyword does not block the other one.
+// Searches every keyword of every product on Mercari. A failing keyword does not block the others.
+// Each listing carries the keys of the products whose filter it passes (usually one).
 async function getTargets() {
   const byId = new Map();
-  const errors = [];
-  for (const kw of KEYWORDS) {
-    try {
-      for (const it of await searchMercari(kw)) if (!byId.has(it.id)) byId.set(it.id, it);
-    } catch (e) {
-      errors.push(`Mercari (${kw}): ${e.message}`);
+  const errors = [], failedKeys = new Set();
+  let searches = 0;
+  for (const p of PRODUCTS) {
+    for (const kw of p.keywords) {
+      searches++;
+      try {
+        for (const it of await searchMercari(kw)) {
+          if (!isTarget(p, it.name)) continue;
+          const known = byId.get(it.id);
+          if (!known) byId.set(it.id, { ...it, keys: [p.key] });
+          else if (!known.keys.includes(p.key)) known.keys.push(p.key);
+        }
+      } catch (e) {
+        errors.push(`Mercari (${kw}): ${e.message}`);
+        failedKeys.add(p.key);
+      }
+      await sleep(300);
     }
   }
-  return { items: [...byId.values()].filter((it) => isTarget(it.name)), errors };
+  return { items: [...byId.values()], errors, searches, failedKeys };
 }
+const productOf = (key) => PRODUCTS.find((p) => p.key === key);
 
 // ---------- ntfy ----------
 async function notify({ title, message, url, image, tags = ["racing_car"], priority = 4 }) {
@@ -244,12 +274,20 @@ const GH_TOKEN = process.env.GITHUB_TOKEN;
 const GH_URL = `https://api.github.com/repos/${process.env.GITHUB_REPOSITORY}/contents/${STATE_FILE}`;
 const ghHeaders = () => ({ Authorization: `Bearer ${GH_TOKEN}`, Accept: "application/vnd.github+json", "User-Agent": "daily-checker" });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-// low: cheapest Mercari listing known ({id, price} in yen), lowHist: listings that were once the
+// ids: listings already notified (all products), inited: product keys whose existing listings
+// were recorded (a product added later is recorded silently first), low: per product the cheapest
+// Mercari listing known ({id, price} in yen), lowHist: per product the listings that were once the
 // cheapest and at what price (last 40), digestDate: WIB date of the last morning summary,
 // rate: last BCA rate read ({sell, asOf}).
+// Older files kept low / lowHist for one product only; those belong to LEGACY_KEY.
 const parseState = (text) => {
   const s = JSON.parse(text.replace(/^﻿/, ""));
-  return { ids: s.ids || null, fails: s.fails || 0, low: s.low || null, lowHist: s.lowHist || {}, digestDate: s.digestDate || "", rate: s.rate || null };
+  let low = s.low || {};
+  if (typeof low.id === "string") low = { [LEGACY_KEY]: low };
+  let lowHist = s.lowHist || {};
+  if (Object.values(lowHist).some((v) => typeof v === "number")) lowHist = { [LEGACY_KEY]: lowHist };
+  const inited = s.inited || (s.ids ? [LEGACY_KEY] : []);
+  return { ids: s.ids || null, fails: s.fails || 0, inited, low, lowHist, digestDate: s.digestDate || "", rate: s.rate || null };
 };
 const emptyState = () => parseState("{}");
 
@@ -288,97 +326,124 @@ const wibDate = () => wibNow().toISOString().slice(0, 10);
 async function checkOnce() {
   const { state } = await loadState();
   const rate = await getRate(state);
-  const { items, errors } = await getTargets();
+  const { items, errors, searches, failedKeys } = await getTargets();
 
-  // Lane TERMURAH runs on its own: if it fails, lane BARU still goes on.
-  let low = null, lowOk = true;
-  try { low = await collectLow(); }
-  catch (e) { lowOk = false; console.log(`Pencarian termurah gagal: ${e.message}`); }
+  // Lane TERMURAH runs on its own, per product: if one fails, everything else still goes on.
+  const lows = {}, lowOk = {};
+  for (const p of PRODUCTS) {
+    try { lows[p.key] = await collectLow(p); lowOk[p.key] = true; }
+    catch (e) { lowOk[p.key] = false; console.log(`Pencarian termurah gagal (${p.key}): ${e.message}`); }
+  }
 
   if (errors.length) {
     const s = await updateState((st) => { st.fails += 1; });
     console.log(`GAGAL (${s.fails}x berturut-turut): ${errors.join(" | ")}`);
-    if (s.fails === 5) await notify({ title: `Watcher ${NAME} bermasalah`, message: `5x gagal berturut-turut: ${errors[0]}`, url: SEARCH_PAGE, tags: ["rotating_light"] });
-    if (errors.length === KEYWORDS.length) return; // every search failed, nothing to compare
+    if (s.fails === 5) await notify({ title: `Watcher ${ALL_NAMES} bermasalah`, message: `5x gagal berturut-turut: ${errors[0]}`, url: PRODUCTS[0].page, tags: ["rotating_light"] });
+    if (errors.length === searches) return; // every search failed, nothing to compare
     state.fails = s.fails;
   }
 
   const rateChanged = !!(rate && rate.at && (!state.rate || state.rate.sell !== rate.sell || state.rate.asOf !== rate.asOf));
   const saveRate = (st) => { if (rateChanged) st.rate = { sell: rate.sell, asOf: rate.asOf }; };
-  const lowChanged = lowOk && ((low && low.id) !== (state.low && state.low.id) || (low && low.price) !== (state.low && state.low.price));
-  const saveLow = (st) => {
-    if (!lowOk) return;
-    st.low = low ? { id: low.id, price: low.price } : null;
-    if (low) {
-      const h = { ...st.lowHist };
-      delete h[low.id]; // re-insert so the newest entries are the ones kept
-      h[low.id] = low.price;
-      st.lowHist = Object.fromEntries(Object.entries(h).slice(-40));
+  const same = (a, b) => (a && a.id) === (b && b.id) && (a && a.price) === (b && b.price);
+  const lowChanged = PRODUCTS.some((p) => lowOk[p.key] && !same(lows[p.key], state.low[p.key]));
+  const saveLows = (st) => {
+    st.low = { ...st.low }; st.lowHist = { ...st.lowHist };
+    for (const p of PRODUCTS) {
+      if (!lowOk[p.key]) continue;
+      const low = lows[p.key];
+      st.low[p.key] = low ? { id: low.id, price: low.price } : null;
+      if (low) {
+        const h = { ...(st.lowHist[p.key] || {}) };
+        delete h[low.id]; // re-insert so the newest entries are the ones kept
+        h[low.id] = low.price;
+        st.lowHist[p.key] = Object.fromEntries(Object.entries(h).slice(-40));
+      }
     }
   };
   const digestHour = wibNow().getUTCHours() >= DIGEST_HOUR;
+  const allKeys = PRODUCTS.map((p) => p.key);
 
   if (!state.ids) {
     await updateState((st) => {
-      st.ids = addIds(st.ids, items.map((i) => i.id)); st.fails = 0;
-      saveLow(st); saveRate(st);
+      st.ids = addIds(st.ids, items.map((i) => i.id)); st.fails = 0; st.inited = allKeys;
+      saveLows(st); saveRate(st);
       if (digestHour) st.digestDate = wibDate();
     });
     console.log(`Run pertama: ${items.length} listing dicatat.`);
-    await notify({ title: `Watcher ${NAME} aktif (GitHub)`, message: `${items.length} listing saat ini dicatat. Komputer boleh dimatikan.`, url: SEARCH_PAGE });
+    await notify({ title: `Watcher ${ALL_NAMES} aktif (GitHub)`, message: `${items.length} listing saat ini dicatat. Komputer boleh dimatikan.`, url: PRODUCTS[0].page });
     return;
   }
 
-  // Lane BARU
+  // A product added to the config: record its listings already on sale without notifying them.
+  // Only once all its searches worked, otherwise it waits for the next check.
   const seen = new Set(state.ids);
-  const fresh = items.filter((i) => !seen.has(i.id));
-  for (const n of fresh) {
-    console.log(`BARU: ${n.price} yen`); // no title or link: Actions logs of a public repo are public
-    const e = era(n.name);
-    await notify({ title: `${NAME} baru ${e.label}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
+  const newKeys = allKeys.filter((k) => !state.inited.includes(k) && !failedKeys.has(k));
+  const isOld = (k) => state.inited.includes(k);
+  const unseen = items.filter((i) => !seen.has(i.id));
+  const fresh = unseen.filter((i) => i.keys.some(isOld));
+  const quiet = unseen.filter((i) => !i.keys.some(isOld) && i.keys.every((k) => newKeys.includes(k)));
+  for (const k of newKeys) {
+    const p = productOf(k);
+    const count = items.filter((i) => i.keys.includes(k)).length;
+    console.log(`Produk baru ditambahkan (${k}): ${count} listing dicatat.`);
+    await notify({ title: `${p.name} ditambahkan`, message: `${count} listing ${p.name} di Mercari saat ini dicatat. Listing baru berikutnya akan dikirim.`, url: p.page });
   }
 
-  // Lane TERMURAH: cheaper than the cheapest known so far. With no "low" recorded yet (first check
-  // with this feature) it is only recorded. A listing that was already the cheapest once at this
-  // price or lower (it only dropped out of the results for a moment) stays quiet.
-  if (lowOk && low && state.low && low.price < state.low.price) {
-    const before = state.lowHist[low.id];
-    if (before === undefined || before > low.price) {
-      const e = era(low.name);
-      console.log(`TERMURAH: ${low.price} yen (sebelumnya ${state.low.price})`);
+  // Lane BARU
+  for (const n of fresh) {
+    console.log(`BARU (${n.keys.join("+")}): ${n.price} yen`); // no title or link: Actions logs of a public repo are public
+    const e = era(productOf(n.keys[0]), n.name);
+    const names = n.keys.map((k) => productOf(k).name).join(" + ");
+    await notify({ title: `${withLabel(`${names} baru`, e)}: ${rp(n.price, rate)}`, message: lines(n.name, rateLine(rate)), url: n.url, image: n.thumb, tags: [e.tag] });
+  }
+
+  // Lane TERMURAH: cheaper than the cheapest known so far, per product. With no "low" recorded
+  // yet for a product (just added) it is only recorded. A listing that was already the cheapest
+  // once at this price or lower (it only dropped out of the results for a moment) stays quiet.
+  for (const p of PRODUCTS) {
+    const low = lows[p.key], prev = state.low[p.key];
+    if (!lowOk[p.key] || !low || !prev || low.price >= prev.price) continue;
+    const before = (state.lowHist[p.key] || {})[low.id];
+    if (before !== undefined && before <= low.price) continue;
+    const e = era(p, low.name);
+    console.log(`TERMURAH (${p.key}): ${low.price} yen (sebelumnya ${prev.price})`);
+    await notify({
+      title: `${withLabel(`TERMURAH | ${p.name}`, e)}: ${rp(low.price, rate)}`,
+      message: lines(low.name, `Termurah sebelumnya: ${rp(prev.price, rate)}`, rateLine(rate)),
+      url: low.url, image: low.thumb, tags: ["moneybag"], priority: 5,
+    });
+  }
+
+  // Morning summary, once a day, one message per product. A product with no cheapest recorded
+  // before this check (just added) joins from the next morning.
+  const digestDue = digestHour && state.digestDate !== wibDate() && PRODUCTS.some((p) => lowOk[p.key]);
+  if (digestDue) {
+    for (const p of PRODUCTS) {
+      const low = lows[p.key];
+      if (!lowOk[p.key] || !low || !state.low[p.key]) continue;
+      const e = era(p, low.name);
       await notify({
-        title: `TERMURAH | ${NAME} ${e.label}: ${rp(low.price, rate)}`,
-        message: lines(low.name, `Termurah sebelumnya: ${rp(state.low.price, rate)}`, rateLine(rate)),
-        url: low.url, image: low.thumb, tags: ["moneybag"], priority: 5,
+        title: `${withLabel(`RANGKUMAN PAGI | ${p.name} termurah`, e)}: ${rp(low.price, rate)}`,
+        message: lines(low.name, rateLine(rate)),
+        url: low.url, image: low.thumb, tags: ["sunrise"], priority: 3,
       });
     }
-  }
-  // First check with this feature: record today's summary as done so it starts tomorrow.
-  const lowFirst = lowOk && !state.low && !state.digestDate;
-
-  // Morning summary, once a day
-  const digestDue = lowOk && !!low && digestHour && state.digestDate !== wibDate() && !lowFirst;
-  if (digestDue) {
-    const e = era(low.name);
-    await notify({
-      title: `RANGKUMAN PAGI | ${NAME} termurah ${e.label}: ${rp(low.price, rate)}`,
-      message: lines(low.name, rateLine(rate)),
-      url: low.url, image: low.thumb, tags: ["sunrise"], priority: 3,
-    });
     console.log("Rangkuman pagi dikirim.");
   }
 
   const resetFails = !errors.length && state.fails;
-  const markDigest = digestDue || (lowFirst && digestHour);
-  if (fresh.length || resetFails || lowChanged || markDigest || rateChanged) {
+  if (fresh.length || quiet.length || newKeys.length || resetFails || lowChanged || digestDue || rateChanged) {
     await updateState((st) => {
-      st.ids = addIds(st.ids, fresh.map((n) => n.id));
+      st.ids = addIds(st.ids, [...fresh, ...quiet].map((n) => n.id));
+      st.inited = [...new Set([...st.inited, ...newKeys])];
       if (resetFails) st.fails = 0;
-      saveLow(st); saveRate(st);
-      if (markDigest) st.digestDate = wibDate();
+      saveLows(st); saveRate(st);
+      if (digestDue) st.digestDate = wibDate();
     });
   }
-  console.log(`OK: ${items.length} listing dicek, ${fresh.length} baru. Termurah: ${lowOk ? (low ? `${low.price} yen = ${rp(low.price, rate)}` : "tidak ada") : "gagal"}.`);
+  const lowText = PRODUCTS.map((p) => `${p.key} ${lowOk[p.key] ? (lows[p.key] ? `${lows[p.key].price} yen = ${rp(lows[p.key].price, rate)}` : "tidak ada") : "gagal"}`).join(", ");
+  console.log(`OK: ${items.length} listing dicek, ${fresh.length} baru. Termurah: ${lowText}.`);
 }
 
 if (!NTFY_TOPIC) { console.log("Secret NTFY_TOPIC belum diisi."); process.exit(1); }
